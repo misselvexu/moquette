@@ -17,6 +17,8 @@
 package io.moquette.integration;
 
 import io.moquette.broker.Server;
+
+import static io.moquette.BrokerConstants.DEFAULT_MOQUETTE_STORE_H2_DB_FILENAME;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.Assert.assertFalse;
 import java.io.File;
@@ -46,29 +48,51 @@ import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Before;
 import org.junit.BeforeClass;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
  * Check that Moquette could also handle SSL.
+ *
+ * This test is based on a server's keystore that contains a keypair, export a certificate for the server and import it in
+ * the client's keystore.
+ *
+ * Command executed to create the key on server's keystore:
+ * <pre>
+ * keytool -genkeypair -alias testserver -keyalg RSA -validity 3650 -keysize 2048 -dname cn=localhost -keystore serverkeystore.jks -keypass passw0rdsrv -storepass passw0rdsrv
+ * </pre>
+ *
+ * Command executed to export the certificate from the server's keystore and import directly in client's keystore:
+ * <pre>
+ * keytool -exportcert -alias testserver -keystore serverkeystore.jks -keypass passw0rdsrv -storepass passw0rdsrv | \
+ * keytool -importcert -trustcacerts -noprompt -alias testserver -keystore clientkeystore.jks -keypass passw0rd -storepass passw0rd
+ * </pre>
+ *
+ * Tip: to verify keystore contents:
+ * <pre>
+ * keytool -list -v -keystore clientkeystore.jks
+ * </pre>
  */
 public class ServerIntegrationSSLTest {
 
     private static final Logger LOG = LoggerFactory.getLogger(ServerIntegrationSSLTest.class);
 
-    Server m_server;
-    static MqttClientPersistence s_dataStore;
+    static String backup;
 
+    Server m_server;
     IMqttClient m_client;
     MessageCollector m_callback;
 
-    static String backup;
+    protected String dbPath;
+
+    @Rule
+    public TemporaryFolder tempFolder = new TemporaryFolder();
 
     @BeforeClass
     public static void beforeTests() {
-        String tmpDir = System.getProperty("java.io.tmpdir");
-        s_dataStore = new MqttDefaultFilePersistence(tmpDir);
         backup = System.getProperty("moquette.path");
     }
 
@@ -87,22 +111,23 @@ public class ServerIntegrationSSLTest {
 
         Properties sslProps = new Properties();
         sslProps.put(BrokerConstants.SSL_PORT_PROPERTY_NAME, "8883");
-        sslProps.put(BrokerConstants.JKS_PATH_PROPERTY_NAME, "serverkeystore.jks");
+        sslProps.put(BrokerConstants.JKS_PATH_PROPERTY_NAME, "src/test/resources/serverkeystore.jks");
         sslProps.put(BrokerConstants.KEY_STORE_PASSWORD_PROPERTY_NAME, "passw0rdsrv");
         sslProps.put(BrokerConstants.KEY_MANAGER_PASSWORD_PROPERTY_NAME, "passw0rdsrv");
-        sslProps.put(BrokerConstants.PERSISTENT_STORE_PROPERTY_NAME, IntegrationUtils.localH2MvStoreDBPath());
+        sslProps.put(BrokerConstants.PERSISTENT_STORE_PROPERTY_NAME, dbPath);
         m_server.startServer(sslProps);
     }
 
     @Before
     public void setUp() throws Exception {
-        String dbPath = IntegrationUtils.localH2MvStoreDBPath();
+        dbPath = IntegrationUtils.tempH2Path(tempFolder);
         File dbFile = new File(dbPath);
         assertFalse(String.format("The DB storagefile %s already exists", dbPath), dbFile.exists());
 
         startServer();
 
-        m_client = new MqttClient("ssl://localhost:8883", "TestClient", s_dataStore);
+        MqttClientPersistence dataStore = new MqttDefaultFilePersistence(tempFolder.newFolder("client").getAbsolutePath());
+        m_client = new MqttClient("ssl://localhost:8883", "TestClient", dataStore);
         // m_client = new MqttClient("ssl://test.mosquitto.org:8883", "TestClient", s_dataStore);
 
         m_callback = new MessageCollector();
@@ -118,7 +143,7 @@ public class ServerIntegrationSSLTest {
         if (m_server != null) {
             m_server.stopServer();
         }
-        IntegrationUtils.clearTestStorage();
+        tempFolder.delete();
     }
 
     @Test
@@ -153,20 +178,6 @@ public class ServerIntegrationSSLTest {
         m_client.disconnect();
     }
 
-    /**
-     * keystore generated into test/resources with command:
-     *
-     * keytool -keystore clientkeystore.jks -alias testclient -genkey -keyalg RSA -> mandatory to
-     * put the name surname -> password is passw0rd -> type yes at the end
-     *
-     * to generate the crt file from the keystore -- keytool -certreq -alias testclient -keystore
-     * clientkeystore.jks -file testclient.csr
-     *
-     * keytool -export -alias testclient -keystore clientkeystore.jks -file testclient.crt
-     *
-     * to import an existing certificate: keytool -keystore clientkeystore.jks -import -alias
-     * testclient -file testclient.crt -trustcacerts
-     */
     private SSLSocketFactory configureSSLSocketFactory() throws KeyManagementException, NoSuchAlgorithmException,
             UnrecoverableKeyException, IOException, CertificateException, KeyStoreException {
         KeyStore ks = KeyStore.getInstance("JKS");

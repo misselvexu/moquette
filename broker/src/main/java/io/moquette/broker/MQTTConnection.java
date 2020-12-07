@@ -20,6 +20,7 @@ import io.moquette.broker.security.IAuthenticator;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelPipeline;
 import io.netty.handler.codec.mqtt.*;
 import io.netty.handler.timeout.IdleStateHandler;
@@ -27,7 +28,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.net.InetSocketAddress;
-import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -47,7 +47,7 @@ final class MQTTConnection {
     private IAuthenticator authenticator;
     private SessionRegistry sessionRegistry;
     private final PostOffice postOffice;
-    private boolean connected;
+    private volatile boolean connected;
     private final AtomicInteger lastPacketId = new AtomicInteger(0);
 
     MQTTConnection(Channel channel, BrokerConfiguration brokerConfig, IAuthenticator authenticator,
@@ -140,13 +140,13 @@ final class MQTTConnection {
         final boolean cleanSession = msg.variableHeader().isCleanSession();
         if (clientId == null || clientId.length() == 0) {
             if (!brokerConfig.isAllowZeroByteClientId()) {
-                LOG.warn("Broker doesn't permit MQTT empty client ID. Username: {}, channel: {}", username, channel);
+                LOG.info("Broker doesn't permit MQTT empty client ID. Username: {}, channel: {}", username, channel);
                 abortConnection(CONNECTION_REFUSED_IDENTIFIER_REJECTED);
                 return;
             }
 
             if (!cleanSession) {
-                LOG.warn("MQTT client ID cannot be empty for persistent session. Username: {}, channel: {}",
+                LOG.info("MQTT client ID cannot be empty for persistent session. Username: {}, channel: {}",
                          username, channel);
                 abortConnection(CONNECTION_REFUSED_IDENTIFIER_REJECTED);
                 return;
@@ -164,21 +164,57 @@ final class MQTTConnection {
             return;
         }
 
+        final SessionRegistry.SessionCreationResult result;
         try {
             LOG.trace("Binding MQTTConnection (channel: {}) to session", channel);
-            sessionRegistry.bindToSession(this, msg, clientId);
-
-            initializeKeepAliveTimeout(channel, msg, clientId);
-            setupInflightResender(channel);
-
-            NettyUtils.clientID(channel, clientId);
-            LOG.trace("CONNACK sent, channel: {}", channel);
-            postOffice.dispatchConnection(msg);
-            LOG.trace("dispatch connection: {}", msg.toString());
+            result = sessionRegistry.createOrReopenSession(msg, clientId, this.getUsername());
+            result.session.bind(this);
         } catch (SessionCorruptedException scex) {
             LOG.warn("MQTT session for client ID {} cannot be created, channel: {}", clientId, channel);
             abortConnection(CONNECTION_REFUSED_SERVER_UNAVAILABLE);
+            return;
         }
+
+        final boolean msgCleanSessionFlag = msg.variableHeader().isCleanSession();
+        boolean isSessionAlreadyPresent = !msgCleanSessionFlag && result.alreadyStored;
+        final String clientIdUsed = clientId;
+        final MqttConnAckMessage ackMessage = MqttMessageBuilders.connAck()
+            .returnCode(CONNECTION_ACCEPTED)
+            .sessionPresent(isSessionAlreadyPresent).build();
+        channel.writeAndFlush(ackMessage).addListener(new ChannelFutureListener() {
+            @Override
+            public void operationComplete(ChannelFuture future) throws Exception {
+                if (future.isSuccess()) {
+                    LOG.trace("CONNACK sent, channel: {}", channel);
+                    if (!result.session.completeConnection()) {
+                        // send DISCONNECT and close the channel
+                        final MqttMessage disconnectMsg = MqttMessageBuilders.disconnect().build();
+                        channel.writeAndFlush(disconnectMsg).addListener(CLOSE);
+                        LOG.warn("CONNACK is sent but the session created can't transition in CONNECTED state");
+                    } else {
+                        NettyUtils.clientID(channel, clientIdUsed);
+                        connected = true;
+                        // OK continue with sending queued messages and normal flow
+
+                        if (result.mode == SessionRegistry.CreationModeEnum.REOPEN_EXISTING) {
+                            result.session.sendQueuedMessagesWhileOffline();
+                        }
+
+                        initializeKeepAliveTimeout(channel, msg, clientIdUsed);
+                        setupInflightResender(channel);
+
+                        postOffice.dispatchConnection(msg);
+                        LOG.trace("dispatch connection: {}", msg.toString());
+                    }
+                } else {
+                    sessionRegistry.disconnect(clientIdUsed);
+                    sessionRegistry.remove(clientIdUsed);
+                    LOG.error("CONNACK send failed, cleanup session and close the connection", future.cause());
+                    channel.close();
+                }
+
+            }
+        });
     }
 
     private void setupInflightResender(Channel channel) {
@@ -210,16 +246,11 @@ final class MQTTConnection {
     }
 
     private void abortConnection(MqttConnectReturnCode returnCode) {
-        MqttConnAckMessage badProto = connAck(returnCode, false);
+        MqttConnAckMessage badProto = MqttMessageBuilders.connAck()
+            .returnCode(returnCode)
+            .sessionPresent(false).build();
         channel.writeAndFlush(badProto).addListener(FIRE_EXCEPTION_ON_FAILURE);
         channel.close().addListener(CLOSE_ON_FAILURE);
-    }
-
-    private MqttConnAckMessage connAck(MqttConnectReturnCode returnCode, boolean sessionPresent) {
-        MqttFixedHeader mqttFixedHeader = new MqttFixedHeader(MqttMessageType.CONNACK, false, MqttQoS.AT_MOST_ONCE,
-            false, 0);
-        MqttConnAckVariableHeader mqttConnAckVariableHeader = new MqttConnAckVariableHeader(returnCode, sessionPresent);
-        return new MqttConnAckMessage(mqttFixedHeader, mqttConnAckVariableHeader);
     }
 
     private boolean login(MqttConnectMessage msg, final String clientId) {
@@ -227,19 +258,19 @@ final class MQTTConnection {
         if (msg.variableHeader().hasUserName()) {
             byte[] pwd = null;
             if (msg.variableHeader().hasPassword()) {
-                pwd = msg.payload().password().getBytes(StandardCharsets.UTF_8);
+                pwd = msg.payload().passwordInBytes();
             } else if (!brokerConfig.isAllowAnonymous()) {
-                LOG.error("Client didn't supply any password and MQTT anonymous mode is disabled CId={}", clientId);
+                LOG.info("Client didn't supply any password and MQTT anonymous mode is disabled CId={}", clientId);
                 return false;
             }
             final String login = msg.payload().userName();
             if (!authenticator.checkValid(clientId, login, pwd)) {
-                LOG.error("Authenticator has rejected the MQTT credentials CId={}, username={}", clientId, login);
+                LOG.info("Authenticator has rejected the MQTT credentials CId={}, username={}", clientId, login);
                 return false;
             }
             NettyUtils.userName(channel, login);
         } else if (!brokerConfig.isAllowAnonymous()) {
-            LOG.error("Client didn't supply any credentials and MQTT anonymous mode is disabled. CId={}", clientId);
+            LOG.info("Client didn't supply any credentials and MQTT anonymous mode is disabled. CId={}", clientId);
             return false;
         }
         return true;
@@ -267,12 +298,6 @@ final class MQTTConnection {
         LOG.trace("dispatch disconnection: clientId={}, userName={}", clientID, userName);
     }
 
-    void sendConnAck(boolean isSessionAlreadyPresent) {
-        connected = true;
-        final MqttConnAckMessage ackMessage = connAck(CONNECTION_ACCEPTED, isSessionAlreadyPresent);
-        channel.writeAndFlush(ackMessage).addListener(FIRE_EXCEPTION_ON_FAILURE);
-    }
-
     boolean isConnected() {
         return connected;
     }
@@ -293,7 +318,7 @@ final class MQTTConnection {
         channel.close().addListener(FIRE_EXCEPTION_ON_FAILURE);
         LOG.trace("Processed DISCONNECT CId={}, channel: {}", clientID, channel);
         String userName = NettyUtils.userName(channel);
-        postOffice.dispatchDisconnection(clientID,userName);
+        postOffice.dispatchDisconnection(clientID, userName);
         LOG.trace("dispatch disconnection: clientId={}, userName={}", clientID, userName);
     }
 
@@ -502,7 +527,9 @@ final class MQTTConnection {
     }
 
     public void readCompleted() {
-        // TODO drain all messages in target's session in-flight message queue
-        postOffice.flushInFlight(this);
+        if (getClientId() != null) {
+            // TODO drain all messages in target's session in-flight message queue
+            postOffice.flushInFlight(this);
+        }
     }
 }
